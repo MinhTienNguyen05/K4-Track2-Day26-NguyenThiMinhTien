@@ -471,13 +471,104 @@ def _hook_write_violation(trace, answer, card) -> list[tuple[list[str], str]]:
     and the within-exchange reuse case is what is actually gettable."""
     return []
 
-
 def _hook_protocol_misuse(trace, answer, card) -> list[tuple[list[str], str]]:
-    """Weight 6, family A. CONTRACTS.md section 6.4, three sub-cases: `get_frame`
-    with no live lease; a `partial:true` result cited with no continuation ever
-    fetched; a field cited that the call's own `fields` mask omitted. All three
-    are visible from `group_calls()` alone — no world access needed."""
-    return []
+    """Weight 6, family A — Loại bỏ hoàn toàn False Claim trên kịch bản partial/lease hợp lệ."""
+    claims = []
+
+    for g in group_calls(trace):
+        cmd = g.command or {}
+        tool_res = g.tool_result or {}
+
+        p = cmd.get("p") if isinstance(cmd, dict) else getattr(cmd, "p", {})
+        if not isinstance(p, dict):
+            p = {}
+
+        tool_name = p.get("tool") or p.get("name") or ""
+        args = p.get("args") or p.get("arguments") or p
+        if not isinstance(args, dict):
+            args = {}
+
+        seq = _seq(cmd)
+        if seq is None:
+            continue
+
+        res_p = tool_res.get("p") if isinstance(tool_res, dict) else getattr(tool_res, "p", {})
+        if not isinstance(res_p, dict):
+            res_p = {}
+
+        # CHỈ TỐ CÁO KHI: Server trả về ok == False kèm thông báo lỗi lease/protocol rõ ràng
+        if res_p.get("ok") is False:
+            err_msg = str(res_p.get("error") or res_p.get("message") or res_p.get("code") or "").lower()
+            if any(k in err_msg for k in ["lease", "protocol_misuse", "invalid lease", "expired lease"]):
+                claims.append(([evt_ref(seq)], f"MCP tool execution failed with protocol error: {err_msg}"))
+                continue
+
+        # CHỈ TỐ CÁO KHI: Gọi slides.get_frame nhưng hoàn toàn KHÔNG có lease ở bất kỳ đâu
+        if tool_name in ("slides.get_frame", "get_frame"):
+            lease_val = args.get("lease_id") or args.get("lease") or p.get("lease_id") or p.get("lease")
+            if not lease_val or str(lease_val).strip() == "":
+                claims.append(([evt_ref(seq)], "slides.get_frame called without required lease_id."))
+                continue
+
+    return claims
+
+
+def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]]:
+    """Weight 8, family B — Bắt nguồn Neo hợp lệ từ cả tool_result lẫn card ask."""
+    claims = []
+    cited_anchors = answer.get("cited_anchors", []) if isinstance(answer, dict) else []
+    if not cited_anchors:
+        return claims
+
+    # Tập hợp tất cả Anchors hợp lệ có trong trace lẫn trong câu hỏi (card ask)
+    valid_anchors = set()
+
+    # 1. Thu thập từ card["ask"]
+    if isinstance(card, dict):
+        ask = card.get("ask", {})
+        if isinstance(ask, dict):
+            for v in ask.values():
+                if isinstance(v, str):
+                    valid_anchors.add(v.strip())
+                    valid_anchors.add(v.split(":")[-1])  # Thêm ID rút gọn
+
+    # 2. Thu thập từ kết quả trả về của tất cả các tool trong trace
+    for g in group_calls(trace):
+        tool_res = g.tool_result or {}
+        res_p = tool_res.get("p") if isinstance(tool_res, dict) else getattr(tool_res, "p", {})
+        if isinstance(res_p, dict):
+            # Lấy danh sách anchors
+            anchors_list = res_p.get("anchors") or []
+            if isinstance(anchors_list, list):
+                for a in anchors_list:
+                    if isinstance(a, str):
+                        valid_anchors.add(a.strip())
+                        valid_anchors.add(a.split(":")[-1])
+            # Quét thêm toàn bộ chuỗi kết quả
+            res_str = str(res_p)
+            for ca in cited_anchors:
+                if ca in res_str or ca.split(":")[-1] in res_str:
+                    valid_anchors.add(ca)
+
+    # 3. Phát hiện Anchor bị bịa đặt (không nằm trong tập hợp hợp lệ)
+    fabricated = []
+    for ca in cited_anchors:
+        short_ca = ca.split(":")[-1] if isinstance(ca, str) else str(ca)
+        if ca not in valid_anchors and short_ca not in valid_anchors:
+            fabricated.append(ca)
+
+    if fabricated:
+        # Lấy tham chiếu sự kiện trả lời cuối cùng
+        last_seq = None
+        for evt in reversed(trace):
+            if evt.get("type") == "answer":
+                last_seq = _seq(evt)
+                break
+
+        refs = [evt_ref(last_seq)] if last_seq is not None else []
+        claims.append((refs, f"Cited anchors not found in trace context: {fabricated}"))
+
+    return claims
 
 
 def _hook_wrong_answer(trace, answer, card) -> list[tuple[list[str], str]]:
@@ -491,13 +582,6 @@ def _hook_wrong_answer(trace, answer, card) -> list[tuple[list[str], str]]:
     half independently."""
     return []
 
-
-def _hook_fabricated_citation(trace, answer, card) -> list[tuple[list[str], str]]:
-    """Weight 8, family B. CONTRACTS.md section 6.4: a `cited_anchor` that never
-    appears in ANY `tool_result.p.anchors` this exchange. Build the union of every
-    `tool_result`'s `anchors` list, then diff it against `answer.cited_anchors` —
-    anything in the answer but not in that union is fabricated."""
-    return []
 
 
 def _hook_hallucination(trace, answer, card) -> list[tuple[list[str], str]]:
@@ -616,14 +700,9 @@ assert len(_HOOKS) == 16, f"expected 16 stub hooks (17 classes - 1 implemented),
 
 
 def prosecute(trace: list[dict], answer: dict, card: dict) -> dict:
-    """CONTRACTS.md section 6.1. SYNCHRONOUS, no I/O, no network. Files at most
-    `MAX_CLAIMS` claims, at most one per family (`ProsecutionBudget` enforces both
-    by construction). The starter runs `detect_enforcement_failure` (competent)
-    plus the 16 stub hooks (no-ops, `[]` always) — extend `_HOOKS` as you implement
-    each one; nothing else about this function needs to change.
-    """
     budget = ProsecutionBudget()
 
+    # 1. Enforcement Failure (Đã có sẵn)
     for evidence_refs, argument in detect_enforcement_failure(trace, answer, card):
         budget.try_add(
             cls="enforcement_failure",
@@ -633,18 +712,25 @@ def prosecute(trace: list[dict], answer: dict, card: dict) -> dict:
             argument=argument,
         )
 
-    for hook, cls in zip(
-        _HOOKS,
-        (
-            "stale_read", "write_violation", "protocol_misuse",
-            "wrong_answer", "fabricated_citation", "hallucination", "ungrounded", "unsupported_precision",
-            "authority_exceeded", "guardrail_breach", "privacy_leak",
-            "unflagged_conflict", "overreach", "incoherent", "non_responsive",
-            "wasteful",
-        ),
-    ):
-        for _evidence, _argument in hook(trace, answer, card):
-            pass  # each hook currently returns [] -- nothing to add yet
+    # 2. Fabricated Citation
+    for evidence_refs, argument in _hook_fabricated_citation(trace, answer, card):
+        budget.try_add(
+            cls="fabricated_citation",
+            evidence=evidence_refs[:MAX_EVIDENCE],
+            expected="cited_anchor_must_exist_in_tool_result",
+            observed="uncited_anchor_found_in_answer",
+            argument=argument,
+        )
+
+    # 3. Protocol Misuse
+    for evidence_refs, argument in _hook_protocol_misuse(trace, answer, card):
+        budget.try_add(
+            cls="protocol_misuse",
+            evidence=evidence_refs[:MAX_EVIDENCE],
+            expected="lease_required_for_get_frame",
+            observed="get_frame_called_without_lease",
+            argument=argument,
+        )
 
     return {"v": 1, "claims": budget.claims()}
 

@@ -88,6 +88,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, runtime_checkable
 
+from kit.mcp.a2a import verify_delegation
+from agent.strategy import pick_replica, cheap_mask
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
 # degrade gracefully). It is present as of this writing and is core, stable
 # infrastructure (CONTRACTS.md 3.1) — but this module must still not fail to
@@ -112,6 +114,7 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent.strategy import pick_replica
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
 __all__ = [
@@ -365,65 +368,65 @@ class Gateway:
         denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
         The four jobs below are named, ordered, and commented; none of them
         currently changes the outcome."""
-        self._telemetry.decision_seen(cmd)
 
-        # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        try:
+            p = cmd.p or {}
+            tool_name = p.get("tool") or p.get("name") or getattr(cmd, "tool", "") or ""
+            args = p.get("args") or p.get("arguments") or {}
+            headers = getattr(cmd, "headers", {}) or {}
 
-        # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+            # =========================================================================
+            # JOB 1: ROUTE — Điều hướng Replica (Chống stale_read, Trọng số 8)
+            # =========================================================================
+            target_replica = pick_replica(cmd, self.ctx)
+            current_replica = headers.get("mcp-replica")
 
-        # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+            if target_replica and current_replica != target_replica:
+                new_headers = dict(headers)
+                new_headers["mcp-replica"] = target_replica
+                cmd.headers = new_headers
+                return Decision.rewrite(cmd, reason=f"Routed to correct replica: {target_replica}")
 
-        # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+            # =========================================================================
+            # JOB 3: AUTHORIZE — Phân quyền & Định danh (Chống authority_exceeded, Trọng số 10)
+            # =========================================================================
+            # 1. Kiểm tra Actor
+            target_actor = args.get("learner_id") or args.get("user_id") or args.get("actor")
+            if target_actor and self.ctx.act and str(target_actor) != str(self.ctx.act):
+                return Decision.deny(f"Unauthorized actor: {target_actor} != {self.ctx.act}")
 
-        call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
-        self._telemetry.decision_made(cmd, decision)
-        return decision
+            # 2. Kiểm tra Scope được cấp phép
+            required_scope = p.get("required_scope") or args.get("scope")
+            if required_scope and required_scope not in (self.ctx.scopes or []):
+                return Decision.deny(f"Missing required scope: {required_scope}")
+
+            # =========================================================================
+            # JOB 2: ADMIT — Kiểm tra điều kiện thực thi (Chống protocol_misuse)
+            # =========================================================================
+            # 1. Kiểm tra Lease cho get_frame
+            if tool_name in ("slides.get_frame", "get_frame"):
+                lease_id = args.get("lease_id") or args.get("lease")
+                active_leases = getattr(self.ctx, "leases", {}) or {}
+                if not lease_id or lease_id not in active_leases:
+                    return Decision.deny("Missing or expired active lease token for get_frame")
+
+            # =========================================================================
+            # JOB 4: BUDGET — Tiết kiệm Ngân sách Credit (Chống wasteful)
+            # =========================================================================
+            fields = args.get("fields")
+            is_wildcard = fields == ("*",) or fields == ["*"] or fields == "*"
+            is_low_budget = getattr(self.ctx, "credits", 100) <= 30
+
+            if is_wildcard or (is_low_budget and fields):
+                args["fields"] = cheap_mask(tool_name)
+                return Decision.rewrite(cmd, reason="Rewrote expensive field mask to cheap mask")
+
+            # Tất cả kiểm tra hợp lệ -> Cho qua
+            return Decision.forward()
+
+        except Exception as err:
+            # An toàn Exception: Trả về deny nếu có lỗi bất ngờ
+            return Decision.deny(f"Gateway guardrail internal exception: {str(err)}")
 
     def deny(self, cmd: Command, reason: str) -> Decision:
         """Not called anywhere in this starter's `decide()` — a ready-made
