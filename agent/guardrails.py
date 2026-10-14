@@ -159,6 +159,16 @@ class InjectionScanResult:
     suspicious: bool
     matched_patterns: tuple[str, ...]
 
+INJECTION_PATTERNS = [
+    r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+    r"(?i)system\s+prompt",
+    r"(?i)disregard\s+(above|prior)",
+    r"(?i)you\s+are\s+now\s+a",
+    r"(?i)override\s+safety",
+    r"(?i)new\s+instruction:",
+    r"\[INST\]",
+    r"<\|im_start\|>",
+]
 
 def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     """STUB — ALWAYS RETURNS `suspicious=False`, REGARDLESS OF `text`.
@@ -177,7 +187,19 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    if not text:
+        return text, False
+
+    detected = False
+    cleaned_text = text
+
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, cleaned_text):
+            detected = True
+            # Vô hiệu hóa lệnh độc hại bằng cách đè vết
+            cleaned_text = re.sub(pattern, "[UNTRUSTED_CONTENT_REMOVED]", cleaned_text)
+
+    return cleaned_text, detected
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +212,13 @@ class RedactionResult:
     redacted_text: str
     hits: tuple[str, ...]
 
+
+PII_PATTERNS = {
+    "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    "phone": r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",
+    "ssn_id": r"\b\d{3}-\d{2}-\d{4}\b|\bID-\d{6,8}\b",
+    "secret_token": r"\b(?:sk|tok|bearer)_[a-zA-Z0-9]{16,}\b",
+}
 
 def redact(text: str) -> RedactionResult:
     """STUB — ALWAYS RETURNS `text` UNCHANGED, `hits=()`.
@@ -205,7 +234,14 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    if not text:
+        return text
+
+    sanitized = text
+    for pii_type, pattern in PII_PATTERNS.items():
+        sanitized = re.sub(pattern, "[REDACTED]", sanitized)
+
+    return sanitized
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +274,25 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
-    return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
-    )
+    if not answer_text:
+        return True
+
+    # Trích xuất toàn bộ các số nguyên và số thập phân trong câu trả lời
+    numbers_in_answer = re.findall(r"\b\d+(?:\.\d+)?\b", answer_text)
+    if not numbers_in_answer:
+        return True
+
+    # Gom toàn bộ văn bản ngữ cảnh thành một chuỗi
+    combined_context = " ".join(context_texts)
+
+    for num in numbers_in_answer:
+        # Bỏ qua các số nhỏ thông dụng (như 0, 1, 2)
+        if num in ("0", "1", "2"):
+            continue
+        if num not in combined_context:
+            return False  # Phát hiện số không có căn cứ (unsupported precision)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +311,18 @@ def abstention_policy(grounding: GroundingResult) -> bool:
     (kit/loop/prompt.py's `SYSTEM_PROMPT`) puts it plainly: "a wrong answer
     costs more than an honest 'insufficient grounding'" — this function is
     the bare floor of that policy, not the ceiling."""
-    return not grounding.grounded
+    if is_blank_card:
+        return None
+
+    # Nếu không tìm thấy anchor nào từ tool result -> Từ chối an toàn
+    if not retrieved_anchors:
+        return {
+            "text": "Insufficient verified source data available to answer this query accurately.",
+            "cited_anchors": [],
+            "spans": [],
+        }
+
+    return None
 
 
 if __name__ == "__main__":
